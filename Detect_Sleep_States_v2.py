@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import datetime
 from pandas.api.types import is_datetime64_ns_dtype
+import plotly.express as px
 
 
 dt_transforms = [
@@ -36,47 +37,6 @@ train_events = pl.read_csv('/Users/joyhc/OneDrive/Desktop/Kaggle Project/child-m
 test_series = pl.scan_parquet('/Users/joyhc/OneDrive/Desktop/Kaggle Project/child-mind-institute-detect-sleep-states/test_series.parquet').with_columns(
     dt_transforms + data_transforms
     )
-
-
-def reduce_mem_usage(df):
-    """ iterate through all numeric columns of a dataframe and modify the data type
-        to reduce memory usage.
-    """
-    start_mem = df.memory_usage().sum() / 1024 ** 2
-    print(f'Memory usage of dataframe is {start_mem:.2f} MB')
-
-    for col in df.columns:
-        col_type = df[col].dtype
-
-        if col_type != object and not is_datetime64_ns_dtype(df[col]):
-            c_min = df[col].min()
-            c_max = df[col].max()
-            if str(col_type)[:3] == 'int':
-                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
-                    df[col] = df[col].astype(np.int8)
-                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
-                    df[col] = df[col].astype(np.int16)
-                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
-                    df[col] = df[col].astype(np.int32)
-                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
-                    df[col] = df[col].astype(np.int64)
-            else:
-                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
-                    df[col] = df[col].astype(np.float16)
-                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
-                    df[col] = df[col].astype(np.float32)
-                else:
-                    df[col] = df[col].astype(np.float16)
-
-    end_mem = df.memory_usage().sum() / 1024 ** 2
-    print(f'Memory usage after optimization is: {end_mem:.2f} MB')
-    decrease = 100 * (start_mem - end_mem) / start_mem
-    print(f'Decreased by {decrease:.2f}%')
-
-    return df
-
-
-train_series = reduce_mem_usage(train_series)
 
 # Getting series ids as a list for convenience
 series_ids = train_events['series_id'].unique(maintain_order=True).to_list()
@@ -225,5 +185,94 @@ def get_events(series, classifier):
     return events
 
 # We will collect datapoints and take 1 million samples
-train_data = train_series.filter(pl.col('series_id').is_in(series_ids)).collect().sample(int(1e6))
+#train_data = train_series.filter(pl.col('series_id').is_in(series_ids)).collect().sample(int(1e6))
+
+def get_events(series, classifier):
+    '''
+    Takes a time series and a classifier and returns a formatted submission dataframe.
+    '''
+
+    series_ids = series['series_id'].unique(maintain_order=True).to_list()
+    events = pl.DataFrame(schema={'series_id': str, 'step': int, 'event': str, 'score': float})
+
+    for idx in tqdm(series_ids):
+
+        # Collecting sample and normalizing features
+        scale_cols = [col for col in feature_cols if (col != 'hour') & (series[col].std() != 0)]
+        X = series.filter(pl.col('series_id') == idx).select(id_cols + feature_cols).with_columns(
+            [(pl.col(col) / series[col].std()).cast(pl.Float32) for col in scale_cols]
+        )
+
+        # Applying classifier to get predictions and scores
+        preds, probs = classifier.predict(X[feature_cols]), classifier.predict_proba(X[feature_cols])[:, 1]
+
+        # NOTE: Considered using rolling max to get sleep periods excluding <30 min interruptions, but ended up decreasing performance
+        X = X.with_columns(
+            pl.lit(preds).cast(pl.Int8).alias('prediction'),
+            pl.lit(probs).alias('probability')
+        )
+
+        # Getting predicted onset and wakeup time steps
+        pred_onsets = X.filter(X['prediction'].diff() > 0)['step'].to_list()
+        pred_wakeups = X.filter(X['prediction'].diff() < 0)['step'].to_list()
+
+        if len(pred_onsets) > 0:
+
+            # Ensuring all predicted sleep periods begin and end
+            if min(pred_wakeups) < min(pred_onsets):
+                pred_wakeups = pred_wakeups[1:]
+
+            if max(pred_onsets) > max(pred_wakeups):
+                pred_onsets = pred_onsets[:-1]
+
+            # Keeping sleep periods longer than 30 minutes
+            sleep_periods = [(onset, wakeup) for onset, wakeup in zip(pred_onsets, pred_wakeups) if
+                             wakeup - onset >= 12 * 30]
+
+            for onset, wakeup in sleep_periods:
+                # Scoring using mean probability over period
+                score = X.filter((pl.col('step') >= onset) & (pl.col('step') <= wakeup))['probability'].mean()
+
+                # Adding sleep event to dataframe
+                events = events.vstack(pl.DataFrame().with_columns(
+                    pl.Series([idx, idx]).alias('series_id'),
+                    pl.Series([onset, wakeup]).alias('step'),
+                    pl.Series(['onset', 'wakeup']).alias('event'),
+                    pl.Series([score, score]).alias('score')
+                ))
+
+    # Adding row id column
+    events = events.to_pandas().reset_index().rename(columns={'index': 'row_id'})
+
+    return events
+
+# Collecting datapoints at every 5 minutes
+train_data = train_series.filter(pl.col('series_id').is_in(series_ids)).take_every(12 * 5).collect()
+
+# Creating train dataset
+X_train, y_train = make_train_dataset(train_data, train_events)
+
+from sklearn.ensemble import RandomForestClassifier
+
+rf_classifier = RandomForestClassifier(random_state=42)
+
+# Training classifier
+rf_classifier = RandomForestClassifier(n_estimators=500,
+                                    min_samples_leaf=25,
+                                    random_state=42,
+                                    n_jobs=-1)
+
+rf_classifier.fit(X_train[feature_cols], y_train)
+
+# Plotting feature importances
+px.bar(x=feature_cols,
+       y=rf_classifier.feature_importances_,
+       title='Random forest feature importances'
+      )
+
+del train_data
+submission = get_events(test_series.collect(), rf_classifier)
+submission.to_csv('/Users/joyhc/OneDrive/Desktop/Kaggle Project/child-mind-institute-detect-sleep-states/submission.csv', index=False)
+
+
 
